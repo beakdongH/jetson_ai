@@ -1,33 +1,19 @@
 #!/usr/bin/env python3
-# live_plot_jetson_temps.py
-# Real-time plotting for Jetson temperature CSV appended by your logger.
-# - Single axes, multiple lines (one per sensor)
-# - No seaborn, no color specification
-# - Labels in English
-# - y-axis fixed to 0..100 °C
-# - -256 (or <= -200) treated as NaN
-# - Robust to header/no-header and common delimiters
-
+# live_plot_jetson_temps_v2.py
 import os, re, time, math, io
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-# VSCode 환경에서 창이 안 뜨면 이 줄의 주석을 해제하세요 (OS에 python3-tk 필요).
-# matplotlib.use("TkAgg")
+# matplotlib.use("TkAgg")  # 창이 안 뜨면 주석 해제
 
-CSV_PATH = r"/var/log/jtop_temps.csv"  # 필요 시 절대경로로 수정 (예: r"C:\path\to\jtop_temps.csv")
-# CSV_PATH = r"/home/USER/jtop_logs/jtop_temps.csv"
-
+CSV_PATH = r"/var/log/jtop_temps.csv"  # 필요 시 절대경로로 수정
 SENSORS = ["CPU","CV0","CV1","CV2","GPU","SoC0","SoC1","SoC2","Tj"]
-EXPECTED_COLS = ["timestamp"] + SENSORS
-
-# Plot window: 최근 N초만 유지 (메모리/성능 관리용)
-WINDOW_SECONDS = 3600  # 1시간
-POLL_INTERVAL = 1.0    # 초
+WINDOW_SECONDS = 3600
+POLL_INTERVAL = 1.0
 
 DELIMS = [
     (",", "ASCII comma"),
@@ -43,7 +29,7 @@ def detect_delim(sample_line: str) -> str:
     for ch, nm in DELIMS:
         if nm == name:
             return ch
-    return ","  # fallback
+    return ","
 
 def first_nonempty_line(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -53,24 +39,19 @@ def first_nonempty_line(path: str) -> str:
     return ""
 
 def parse_line(line: str, sep: str, has_header_decision: bool):
-    # returns (ts_float, values_dict) or (None, None) if unparsable/header
+    # return (datetime_obj, dict) or ("HEADER", None) or (None, None)
     parts = [p.strip() for p in re.split(re.escape(sep), line.rstrip("\r\n"))]
     if len(parts) < 2:
         return None, None
 
-    # header detection: if first token contains non-digit for date and decision == None
     if has_header_decision is None:
         try:
             datetime.fromisoformat(parts[0].replace("Z",""))
-            # first token is datetime -> it's data
-            pass
         except Exception:
-            # header
             return "HEADER", None
 
-    # parse timestamp
     try:
-        ts = datetime.fromisoformat(parts[0].replace("Z",""))
+        ts_dt = datetime.fromisoformat(parts[0].replace("Z",""))
     except Exception:
         return None, None
 
@@ -82,13 +63,13 @@ def parse_line(line: str, sep: str, has_header_decision: bool):
         token = parts[i].replace("+","").replace(",",".")
         try:
             v = float(token)
-            if v <= -200:  # -256 sentry etc.
+            if v <= -200:
                 v = math.nan
         except Exception:
             v = math.nan
         vals[name] = v
 
-    return ts.timestamp(), vals
+    return ts_dt, vals
 
 def main():
     p = Path(CSV_PATH)
@@ -96,21 +77,14 @@ def main():
         print(f"CSV not found: {p}")
         return
 
-    # delimiter detection
     sample = first_nonempty_line(CSV_PATH)
-    if not sample:
-        print("CSV is empty; waiting for data...")
-        sep = ","
-    else:
-        sep = detect_delim(sample)
+    sep = detect_delim(sample) if sample else ","
 
-    # state
     last_size = 0
-    header_known = None  # None: unknown, True: has header already skipped, False: no header
-    times = []  # epoch seconds
+    header_known = None
+    times = []  # list[datetime]
     series = {name: [] for name in SENSORS}
 
-    # figure
     plt.ion()
     fig, ax = plt.subplots(figsize=(10,5))
     ax.set_title("Jetson Temperature")
@@ -118,10 +92,10 @@ def main():
     ax.set_ylabel("Temperature (°C)")
     ax.set_ylim(0, 100)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+
     lines = {}
     for name in SENSORS:
-        # create one line per sensor; no color specified
-        (ln,) = ax.plot([], [], label=name)
+        (ln,) = ax.plot([], [], label=name)  # no color specified
         lines[name] = ln
     ax.legend(title="Sensors", loc="best")
     fig.tight_layout()
@@ -130,10 +104,9 @@ def main():
     while True:
         try:
             size = p.stat().st_size
-            # log rotation/truncation handling
             if size < last_size:
                 last_size = 0
-            # read new bytes
+
             with open(CSV_PATH, "r", encoding="utf-8", errors="ignore") as f:
                 f.seek(last_size)
                 chunk = f.read()
@@ -143,23 +116,22 @@ def main():
                 for line in io.StringIO(chunk):
                     if not line.strip():
                         continue
-                    ts, vals = parse_line(line, sep, header_known)
-                    if ts == "HEADER":
+                    ts_dt, vals = parse_line(line, sep, header_known)
+                    if ts_dt == "HEADER":
                         header_known = True
                         continue
-                    if ts is None:
+                    if ts_dt is None:
                         continue
                     if header_known is None:
                         header_known = False
 
-                    times.append(ts)
+                    times.append(ts_dt)
                     for name in SENSORS:
                         series[name].append(vals[name])
 
-            # drop old points outside window
+            # window trim
             if times:
-                cutoff = times[-1] - WINDOW_SECONDS
-                # find first index >= cutoff
+                cutoff = times[-1] - timedelta(seconds=WINDOW_SECONDS)
                 idx0 = 0
                 for i, t in enumerate(times):
                     if t >= cutoff:
@@ -170,18 +142,15 @@ def main():
                     for name in SENSORS:
                         series[name] = series[name][idx0:]
 
-            # update plot if we have data
+            # update plot
             if times:
-                x = mdates.epoch2num(np.array(times, dtype=float))
+                x = mdates.date2num(times)  # ← epoch2num 대신 date2num
                 for name in SENSORS:
                     y = np.array(series[name], dtype=float)
-                    # Update line data
                     lines[name].set_data(x, y)
-                # set x-limits to data range
-                ax.set_xlim(x.min(), x.max() if x.size > 1 else x.min() + 1/86400)  # +1s in days
+                ax.set_xlim(x.min(), x.max() if len(x) > 1 else x.min() + 1/86400)  # +1s in days
                 ax.relim(visible_only=True)
-                ax.autoscale_view(scaley=False)  # y fixed (0..100)
-
+                ax.autoscale_view(scaley=False)  # keep y 0..100
                 plt.pause(0.001)
 
             time.sleep(POLL_INTERVAL)
